@@ -11,8 +11,11 @@ module Development.IDE.Core.FileStore(
     VFSHandle,
     makeVFSHandle,
     makeLSPVFSHandle,
+    fingerprintSource
     ) where
 
+import Foreign.ForeignPtr
+import Fingerprint
 import           StringBuffer
 import Development.IDE.GHC.Orphans()
 import Development.IDE.GHC.Util
@@ -94,11 +97,13 @@ data GetFileExists = GetFileExists
     deriving (Eq, Show, Generic)
 instance Hashable GetFileExists
 instance NFData   GetFileExists
+instance Binary   GetFileExists
 
 data GetFileContents = GetFileContents
     deriving (Eq, Show, Generic)
 instance Hashable GetFileContents
 instance NFData   GetFileContents
+instance Binary   GetFileContents
 
 
 getFileExistsRule :: VFSHandle -> Rules ()
@@ -151,6 +156,13 @@ getModificationTimeRule vfs =
 -- as doing the FFI call ourselves :(.
 foreign import ccall "getmodtime" c_getModTime :: CString -> Ptr CTime -> Ptr CLong -> IO Int
 #endif
+
+fingerprintSource :: NormalizedFilePath -> Action Fingerprint
+fingerprintSource file = do
+    (_, mbContent) <- getFileContents file
+    content <- liftIO $ maybe (hGetStringBuffer $ fromNormalizedFilePath file) pure mbContent
+    liftIO $ fpStringBuffer content
+    where fpStringBuffer (StringBuffer buf len cur) = withForeignPtr buf $ \ptr -> fingerprintData (ptr `plusPtr` cur) len
 
 getFileContentsRule :: VFSHandle -> Rules ()
 getFileContentsRule vfs =

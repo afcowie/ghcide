@@ -26,7 +26,7 @@ module Development.IDE.Core.Shake(
     shakeProfile,
     use, useWithStale, useNoFile, uses, usesWithStale,
     use_, useNoFile_, uses_,
-    define, defineEarlyCutoff,
+    define, defineEarlyCutoff, defineOnDisk, needOnDisk, needOnDisks, fingerprintToBS,
     getDiagnostics, unsafeClearDiagnostics,
     IsIdeGlobal, addIdeGlobal, getIdeGlobalState, getIdeGlobalAction,
     garbageCollect,
@@ -39,7 +39,11 @@ module Development.IDE.Core.Shake(
     updatePositionMapping
     ) where
 
-import           Development.Shake hiding (ShakeValue)
+import Foreign.Ptr
+import Foreign.Storable
+import GHC.Fingerprint
+import           Development.Shake hiding (ShakeValue, doesFileExist)
+import System.Directory (doesFileExist)
 import           Development.Shake.Database
 import           Development.Shake.Classes
 import           Development.Shake.Rule
@@ -47,6 +51,7 @@ import qualified Data.HashMap.Strict as HMap
 import qualified Data.Map.Strict as Map
 import qualified Data.Map.Merge.Strict as Map
 import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Internal as BS
 import           Data.Dynamic
 import           Data.Maybe
 import Data.Map.Strict (Map)
@@ -202,11 +207,7 @@ mappingForVersion allMappings file ver =
 
 type IdeRule k v =
   ( Shake.RuleResult k ~ v
-  , Show k
-  , Typeable k
-  , NFData k
-  , Hashable k
-  , Eq k
+  , Shake.ShakeValue k
   , Show v
   , Typeable v
   , NFData v
@@ -458,12 +459,9 @@ isBadDependency x
     | otherwise = False
 
 newtype Q k = Q (k, NormalizedFilePath)
-    deriving (Eq,Hashable,NFData)
+    deriving (Eq,Hashable,NFData, Generic)
 
--- Using Database we don't need Binary instances for keys
-instance Binary (Q k) where
-    put _ = return ()
-    get = fail "Binary.get not defined for type Development.IDE.Core.Shake.Q"
+instance Binary k => Binary (Q k)
 
 instance Show k => Show (Q k) where
     show (Q (k, file)) = show k ++ "; " ++ fromNormalizedFilePath file
@@ -538,6 +536,74 @@ defineEarlyCutoff op = addBuiltinRule noLint noIdentity $ \(Q (key, file)) (old 
                 (if eq then ChangedRecomputeSame else ChangedRecomputeDiff)
                 (encodeShakeValue bs) $
                 A res bs
+
+
+-- | Rule type, input file, output file
+data QDisk k = QDisk k NormalizedFilePath NormalizedFilePath
+  deriving (Eq, Generic)
+
+instance Hashable k => Hashable (QDisk k)
+
+instance NFData k => NFData (QDisk k)
+
+instance Binary k => Binary (QDisk k)
+
+instance Show k => Show (QDisk k) where
+    show (QDisk k inputFile outputFile) =
+        show k ++ "; " ++ fromNormalizedFilePath inputFile  ++
+        "; " ++ fromNormalizedFilePath outputFile
+
+type instance RuleResult (QDisk k) = Bool
+
+defineOnDisk
+  :: (Shake.ShakeValue k, RuleResult k ~ ())
+  => (k -> NormalizedFilePath -> NormalizedFilePath -> Action (IdeResult ()))
+  -> Rules ()
+defineOnDisk act = addBuiltinRule noLint noIdentity $
+  \(QDisk key inFile outFile) (mbOld :: Maybe BS.ByteString) mode -> do
+      extras <- getShakeExtras
+      let getHash = liftIO $ do
+              exists <- doesFileExist (fromNormalizedFilePath outFile)
+              if exists
+                then fingerprintToBS <$> getFileHash (fromNormalizedFilePath outFile)
+                else pure ""
+      let runAct = actionCatch (act key inFile outFile) $
+              \(e :: SomeException) -> pure ([ideErrorText inFile $ T.pack $ displayException e | not $ isBadDependency e], Nothing)
+      case mbOld of
+          Nothing -> do
+              (diags, r) <- runAct
+              updateFileDiagnostics inFile (Key key) extras $ map snd diags
+              current <- if isJust r then getHash else pure ""
+              pure $ RunResult ChangedRecomputeDiff current (not $ BS.null current)
+          Just old -> do
+              current <- getHash
+              if mode == RunDependenciesSame && old == current && not (BS.null current)
+                  then do
+                    pure $ RunResult ChangedNothing current (not (BS.null current))
+                  else do
+                    (diags, r) <- runAct
+                    updateFileDiagnostics inFile (Key key) extras $ map snd diags
+                    new <- if isJust r then getHash else pure ""
+                    let change
+                          | new == old = ChangedRecomputeSame
+                          | otherwise = ChangedRecomputeDiff
+                    pure $ RunResult change new (not $ BS.null new)
+
+fingerprintToBS :: Fingerprint -> BS.ByteString
+fingerprintToBS (Fingerprint a b) = BS.unsafeCreate 8 $ \ptr -> do
+    ptr <- pure $ castPtr ptr
+    pokeElemOff ptr 0 a
+    pokeElemOff ptr 1 b
+
+needOnDisk :: (Shake.ShakeValue k, RuleResult k ~ ()) => k -> NormalizedFilePath -> NormalizedFilePath -> Action ()
+needOnDisk k inFile outFile = do
+    successfull <- apply1 (QDisk k inFile outFile)
+    liftIO $ unless successfull $ throwIO BadDependency
+
+needOnDisks :: (Shake.ShakeValue k, RuleResult k ~ ()) => k -> [(NormalizedFilePath, NormalizedFilePath)] -> Action ()
+needOnDisks k files = do
+    successfulls <- apply $ map (\(inFile, outFile) -> QDisk k inFile outFile) files
+    liftIO $ unless (and successfulls) $ throwIO BadDependency
 
 toShakeValue :: (BS.ByteString -> ShakeValue) -> Maybe BS.ByteString -> ShakeValue
 toShakeValue = maybe ShakeNoCutoff
@@ -626,6 +692,7 @@ data GetModificationTime = GetModificationTime
     deriving (Eq, Show, Generic)
 instance Hashable GetModificationTime
 instance NFData   GetModificationTime
+instance Binary   GetModificationTime
 
 -- | Get the modification time of a file.
 type instance RuleResult GetModificationTime = FileVersion
