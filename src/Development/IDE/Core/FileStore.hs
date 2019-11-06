@@ -11,7 +11,7 @@ module Development.IDE.Core.FileStore(
     VFSHandle,
     makeVFSHandle,
     makeLSPVFSHandle,
-    fingerprintSource
+    getSourceFingerprint
     ) where
 
 import Foreign.ForeignPtr
@@ -92,6 +92,7 @@ type instance RuleResult GetFileContents = (FileVersion, Maybe StringBuffer)
 -- | Does the file exist.
 type instance RuleResult GetFileExists = Bool
 
+type instance RuleResult FingerprintSource = Fingerprint
 
 data GetFileExists = GetFileExists
     deriving (Eq, Show, Generic)
@@ -105,6 +106,20 @@ instance Hashable GetFileContents
 instance NFData   GetFileContents
 instance Binary   GetFileContents
 
+data FingerprintSource = FingerprintSource
+    deriving (Eq, Show, Generic)
+instance Hashable FingerprintSource
+instance NFData   FingerprintSource
+instance Binary   FingerprintSource
+
+fingerprintSourceRule :: Rules ()
+fingerprintSourceRule =
+    define $ \FingerprintSource file -> do
+      (_, mbContent) <- getFileContents file
+      content <- liftIO $ maybe (hGetStringBuffer $ fromNormalizedFilePath file) pure mbContent
+      fingerprint <- liftIO $ fpStringBuffer content
+      pure ([], Just fingerprint)
+    where fpStringBuffer (StringBuffer buf len cur) = withForeignPtr buf $ \ptr -> fingerprintData (ptr `plusPtr` cur) len
 
 getFileExistsRule :: VFSHandle -> Rules ()
 getFileExistsRule vfs =
@@ -157,12 +172,8 @@ getModificationTimeRule vfs =
 foreign import ccall "getmodtime" c_getModTime :: CString -> Ptr CTime -> Ptr CLong -> IO Int
 #endif
 
-fingerprintSource :: NormalizedFilePath -> Action Fingerprint
-fingerprintSource file = do
-    (_, mbContent) <- getFileContents file
-    content <- liftIO $ maybe (hGetStringBuffer $ fromNormalizedFilePath file) pure mbContent
-    liftIO $ fpStringBuffer content
-    where fpStringBuffer (StringBuffer buf len cur) = withForeignPtr buf $ \ptr -> fingerprintData (ptr `plusPtr` cur) len
+getSourceFingerprint :: NormalizedFilePath -> Action Fingerprint
+getSourceFingerprint = use_ FingerprintSource
 
 getFileContentsRule :: VFSHandle -> Rules ()
 getFileContentsRule vfs =
@@ -200,6 +211,7 @@ fileStoreRules vfs = do
     getModificationTimeRule vfs
     getFileContentsRule vfs
     getFileExistsRule vfs
+    fingerprintSourceRule
 
 
 -- | Notify the compiler service that a particular file has been modified.

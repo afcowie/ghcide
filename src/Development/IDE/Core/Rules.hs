@@ -149,8 +149,8 @@ getParsedModuleRule =
         packageState <- hscEnv <$> use_ GhcSession file
         opt <- getIdeOptions
         r <- liftIO $ parseModule opt packageState (fromNormalizedFilePath file) contents
-        fp <- fingerprintToBS <$> fingerprintSource file
-        pure (Just fp, r)
+        fp <- getSourceFingerprint file
+        pure (Just $ fingerprintToBS fp, r)
 
 getLocatedImportsRule :: Rules ()
 getLocatedImportsRule =
@@ -261,7 +261,7 @@ getDependenciesRule =
         depInfo@DependencyInformation{..} <- use_ GetDependencyInformation file
         let allFiles = reachableModules depInfo
         _ <- uses_ ReportImportCycles allFiles
-        fps <- mapM fingerprintSource allFiles
+        fps <- mapM getSourceFingerprint (file : allFiles)
         return (Just $ fingerprintToBS $ fingerprintFingerprints fps, ([], transitiveDeps depInfo file))
 
 -- Source SpanInfo is used by AtPoint and Goto Definition.
